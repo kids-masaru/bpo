@@ -700,7 +700,7 @@ def main():
         
         # Check existing data
         with st.status("既存データとの照合中...", expanded=False) as status:
-            sheet = get_sheet(st.secrets["gcp_service_account"]["GSHEET_ID"] if "gcp_service_account" in st.secrets else st.secrets["GSHEET_ID"])
+            sheet = get_sheet(st.secrets["GSHEET_ID"])
             annotated = step3_check_existing(api_key, sheet, st.session_state.groups)
             status.update(label="照合完了！", state="complete")
         
