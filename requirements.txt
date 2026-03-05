@@ -1,0 +1,7 @@
+google-genai
+gspread
+google-api-python-client
+google-auth
+streamlit
+openpyxl
+python-docx

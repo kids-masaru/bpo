@@ -1,0 +1,11 @@
+service_account.json
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Streamlit
+.streamlit/
+
+# Temporary files
+temp_*
