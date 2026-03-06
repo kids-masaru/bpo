@@ -451,15 +451,45 @@ def load_historical_data(spreadsheet_id):
         headers = data[0]
         df = pd.DataFrame(data[1:], columns=headers)
         
-        # Map natural language headers back to COLUMN_LAYOUT keys
-        reverse_map = {v: k for k, v in DISPLAY_COLS.items()}
+        # Fuzzy map natural language headers back to COLUMN_LAYOUT keys
         rename_dict = {}
+        # Hardcoded fallbacks for headers that changed significantly in the sheet
+        hardcoded_map = {
+            "年間基本額（委託料/補助金額上限）": "O_年間基本額上限",
+            "必須配置人数（常時）": "V_必須配置人数",
+            "評価配点（総点）": "AA_評価総点",
+            "年度": "AN_公募年度",
+            "保護者からの利用料徴収主体": "Q_利用料徴収主体",
+            "消耗品・おやつ代の負担": "S_消耗品おやつ代負担",
+            "エリア指定・学区": "U_エリア指定",
+            "施設長（責任者）要件": "X_施設長要件",
+            "開所時間・延長保育": "Y_開所時間",
+            "【配点】価格点（%）": "AB_価格点割合パーセント",
+            "【配点】企画・事業内容": "AC_企画事業内容配点",
+            "【配点】職員体制・実績": "AD_職員体制実績配点",
+            "【配点】安全管理・危機管理": "AE_安全管理危機管理配点",
+            "特殊な必須業務（キーワード抽出）": "AH_特殊な必須業務"
+        }
+        
         for h in df.columns:
             h_clean = str(h).strip()
-            if h_clean in reverse_map:
-                rename_dict[h] = reverse_map[h_clean]
-            elif h_clean == "No.":
+            if h_clean == "No.":
                 rename_dict[h] = "A_No"
+                continue
+            
+            if h_clean in hardcoded_map:
+                rename_dict[h] = hardcoded_map[h_clean]
+                continue
+                
+            # Perform fuzzy match to handle brackets and spaces
+            h_fuzzy = h_clean.replace("（", "").replace("）", "").replace("(", "").replace(")", "").replace("％", "").replace("%", "").replace("・", "")
+            for col_key in COLUMN_LAYOUT:
+                expected_desc = col_key.split("_", 1)[1] if "_" in col_key else col_key
+                expected_fuzzy = expected_desc.replace("（", "").replace("）", "").replace("(", "").replace(")", "").replace("％", "").replace("%", "").replace("・", "")
+                
+                if expected_fuzzy == h_fuzzy:
+                    rename_dict[h] = col_key
+                    break
         df.rename(columns=rename_dict, inplace=True)
         
         # Ensure numeric columns are converted
@@ -498,12 +528,48 @@ def render_dashboard(df, spreadsheet_target):
 
     # Facility Comparison
     if "E_施設区分" in df.columns:
-        st.write("### 🏢 施設ごとの平均データ")
+        st.write("### 🏢 施設ごとの市場データ")
         # Filter out empty facility types
         df_facilities = df[df["E_施設区分"].notna() & (df["E_施設区分"] != "")]
         
         if not df_facilities.empty:
-            # Aggregate metrics
+            # 1. Row of Charts: Pie Chart (smaller) + Top Municipalities + Yearly Trend
+            chart_col1, chart_col2, chart_col3 = st.columns([1, 1.2, 1.2])
+            
+            with chart_col1:
+                st.write("**施設区分別の案件割合**")
+                count_df = df_facilities["E_施設区分"].value_counts().reset_index()
+                count_df.columns = ["施設区分", "案件数"]
+                # Adjusting layout to be smaller and tighter
+                fig_pie = px.pie(count_df, names="施設区分", values="案件数", hole=.4)
+                fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300, showlegend=False)
+                fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            with chart_col2:
+                if "C_自治体名" in df.columns:
+                    st.write("**案件が多い自治体 トップ10**")
+                    muni_data = df_facilities["C_自治体名"].replace("null", pd.NA).dropna()
+                    muni_data = muni_data[muni_data.str.strip() != ""]
+                    top_muni = muni_data.value_counts().head(10).reset_index()
+                    top_muni.columns = ["自治体名", "案件数"]
+                    # Horizontal bar chart, sorted ascending so largest is at top
+                    fig_muni = px.bar(top_muni.sort_values("案件数", ascending=True), 
+                                      x="案件数", y="自治体名", orientation='h')
+                    fig_muni.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
+                    st.plotly_chart(fig_muni, use_container_width=True)
+
+            with chart_col3:
+                if "AN_公募年度" in df.columns:
+                    st.write("**年度別・施設区分の案件推移**")
+                    yearly_df = df_facilities.groupby(["AN_公募年度", "E_施設区分"]).size().reset_index(name="案件数")
+                    yearly_df = yearly_df.sort_values("AN_公募年度")
+                    fig_bar = px.bar(yearly_df, x="AN_公募年度", y="案件数", color="E_施設区分", barmode="group")
+                    fig_bar.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300, legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5))
+                    st.plotly_chart(fig_bar, use_container_width=True)
+
+            # 2. Summary Table of Averages
+            st.write("**施設区分別の平均指標**")
             agg_dict = {}
             if "O_年間基本額上限" in df.columns:
                 agg_dict["O_年間基本額上限"] = "mean"
@@ -514,8 +580,6 @@ def render_dashboard(df, spreadsheet_target):
                 
             if agg_dict:
                 grouped = df_facilities.groupby("E_施設区分").agg(agg_dict).reset_index()
-                
-                # Format for display
                 display_grouped = pd.DataFrame()
                 display_grouped["施設区分"] = grouped["E_施設区分"]
                 if "O_年間基本額上限" in grouped.columns:
@@ -524,73 +588,56 @@ def render_dashboard(df, spreadsheet_target):
                     display_grouped["平均 必須配置人数"] = grouped["V_必須配置人数"].apply(lambda x: f"{x:.1f}人" if pd.notna(x) else "-")
                 if "AA_評価総点" in grouped.columns:
                     display_grouped["平均 評価総点"] = grouped["AA_評価総点"].apply(lambda x: f"{x:.1f}点" if pd.notna(x) else "-")
-                
                 st.dataframe(display_grouped, use_container_width=True, hide_index=True)
-            
-            # Simple bar chart for count distribution
-            chart_col1, chart_col2 = st.columns(2)
-            with chart_col1:
-                st.write("**施設区分別の案件数**")
-                count_df = df_facilities["E_施設区分"].value_counts().reset_index()
-                count_df.columns = ["施設区分", "案件数"]
-                fig_pie = px.pie(count_df, names="施設区分", values="案件数", hole=.3)
-                fig_pie.update_layout(margin=dict(t=0, b=0, l=0, r=0))
-                st.plotly_chart(fig_pie, use_container_width=True)
-            
-            with chart_col2:
-                if "AN_公募年度" in df.columns:
-                    st.write("**年度別・施設区分の推移**")
-                    yearly_df = df_facilities.groupby(["AN_公募年度", "E_施設区分"]).size().reset_index(name="案件数")
-                    yearly_df = yearly_df.sort_values("AN_公募年度")
-                    fig_bar = px.bar(yearly_df, x="AN_公募年度", y="案件数", color="E_施設区分", barmode="group")
-                    fig_bar.update_layout(margin=dict(t=20, b=20, l=0, r=0))
-                    st.plotly_chart(fig_bar, use_container_width=True)
 
     st.divider()
     
     st.subheader("📋 提案要求・準備物 カタログ")
     st.write("過去の案件で実際に求められた事項を網羅的に確認し、社内の既存アセット（保育園マニュアル等）の適応可否を判断するための材料です。")
     
-    cat_tab1, cat_tab2 = st.tabs(["🔍 キーワード検索・絞り込み", "📈 要素別 出現頻度"])
+    # Global filter for the entire Catalog section (improves UX)
+    st.markdown("##### 🔍 全体絞り込み")
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+         facility_filter = "すべて"
+         if "E_施設区分" in df.columns:
+             options = ["すべて"] + sorted([str(x) for x in df["E_施設区分"].dropna().unique() if x])
+             facility_filter = st.selectbox("対象の施設区分を選択", options)
+    with col_f2:
+         search_query = st.text_input("キーワード検索 (例: 研修, 防災, タブレット)", "")
+    
+    st.write("") # Spacing
+    
+    cat_tab1, cat_tab2 = st.tabs(["📑 要求事項の一覧表", "📈 要素別 出現頻度（レーダーチャート）"])
+    
+    # Apply filters
+    filter_df = df.copy()
+    if facility_filter != "すべて" and "E_施設区分" in filter_df.columns:
+         filter_df = filter_df[filter_df["E_施設区分"] == facility_filter]
+         
+    if search_query:
+         mask1 = False
+         mask2 = False
+         if "AP_物理的システム的準備リスト" in filter_df.columns:
+              mask1 = filter_df["AP_物理的システム的準備リスト"].astype(str).str.contains(search_query, case=False, na=False)
+         if "AO_提案要求リスト" in filter_df.columns:
+              mask2 = filter_df["AO_提案要求リスト"].astype(str).str.contains(search_query, case=False, na=False)
+         filter_df = filter_df[mask1 | mask2]
     
     with cat_tab1:
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-             facility_filter = "すべて"
-             if "E_施設区分" in df.columns:
-                 options = ["すべて"] + sorted([str(x) for x in df["E_施設区分"].dropna().unique() if x])
-                 facility_filter = st.selectbox("施設区分で絞り込み", options)
-        with col_f2:
-             search_query = st.text_input("🔍 準備物・要求リスト内を検索 (例: 研修, 防災, アプリ)", "")
-        
+        st.write(f"**詳細データ一覧 ({len(filter_df)}件)**")
         display_cols = ["C_自治体名", "D_案件名", "E_施設区分", "AO_提案要求リスト", "AP_物理的システム的準備リスト"]
         available_cols = [c for c in display_cols if c in df.columns]
         
-        filter_df = df.copy()
-        if facility_filter != "すべて" and "E_施設区分" in filter_df.columns:
-             filter_df = filter_df[filter_df["E_施設区分"] == facility_filter]
-             
-        if search_query:
-             mask1 = False
-             mask2 = False
-             if "AP_物理的システム的準備リスト" in filter_df.columns:
-                  mask1 = filter_df["AP_物理的システム的準備リスト"].astype(str).str.contains(search_query, case=False, na=False)
-             if "AO_提案要求リスト" in filter_df.columns:
-                  mask2 = filter_df["AO_提案要求リスト"].astype(str).str.contains(search_query, case=False, na=False)
-             filter_df = filter_df[mask1 | mask2]
-             
-        # Map internal column names back to display names
         display_raw_df = filter_df[available_cols].copy()
         display_raw_df = display_raw_df.rename(columns=DISPLAY_COLS)
         st.dataframe(display_raw_df, use_container_width=True, hide_index=True)
-        st.caption(f"表示件数: {len(display_raw_df)}件")
 
     with cat_tab2:
         st.write("主要なキーワードが「提案要求・準備物」の中にどれくらい出現しているかを集計します。")
-        st.write("※ 特定の施設区分での求められる重点ポイント（安全、ICTなど）を視覚化します。")
+        st.write("※ 選択した施設区分で、特に注力すべき重点ポイント（安全、ICTなど）を視覚化します。")
         
         if "AO_提案要求リスト" in df.columns or "AP_物理的システム的準備リスト" in df.columns:
-            # Simple keyword count for visualization
             keywords = {
                 "安全・防災（危機管理）": ["安全", "防災", "危機管理", "避難", "事故"],
                 "運営・マネジメント": ["運営", "管理", "方針", "理念", "体制"],
@@ -601,16 +648,9 @@ def render_dashboard(df, spreadsheet_target):
                 "研修・人材育成": ["研修", "育成", "人材", "スキル"]
             }
             
-            target_df = df.copy()
-            target_facility_filter = "すべて"
-            if "E_施設区分" in df.columns:
-                 target_facility_filter = st.selectbox("分析対象の施設区分", ["すべて"] + sorted([str(x) for x in df["E_施設区分"].dropna().unique() if x]))
-                 if target_facility_filter != "すべて":
-                     target_df = target_df[target_df["E_施設区分"] == target_facility_filter]
-            
+            target_df = filter_df
             fit_stats = []
             
-            # Combine text fields
             text_series = pd.Series(dtype=str)
             if "AO_提案要求リスト" in target_df.columns:
                 text_series = target_df["AO_提案要求リスト"].astype(str)
@@ -621,7 +661,6 @@ def render_dashboard(df, spreadsheet_target):
             
             if total_records > 0:
                 for label, kws in keywords.items():
-                    # Count how many rows contain at least one of the keywords
                     count = text_series.str.contains("|".join(kws), case=False, na=False).sum()
                     fit_stats.append({"要素": label, "出現件数": count, "全体に対する割合(%)": round((count/total_records)*100, 1)})
                 
@@ -629,20 +668,19 @@ def render_dashboard(df, spreadsheet_target):
                 
                 col_chart1, col_chart2 = st.columns(2)
                 with col_chart1:
-                    # Rename columns to ensure px.line_polar finds them
                     plot_df = fit_df.copy()
                     plot_df.columns = ["要素", "出現件数", "割合"]
                     
                     fig_radar = px.line_polar(plot_df, r="割合", theta="要素", line_close=True, markers=True,
                                               hover_data=["出現件数"],
-                                              title=f"{target_facility_filter}の要求キーワード分布",
+                                              title=f"{facility_filter}の要求キーワード分布",
                                               range_r=[0, 100])
                     fig_radar.update_traces(fill='toself')
                     st.plotly_chart(fig_radar, use_container_width=True)
                 with col_chart2:
                     st.dataframe(fit_df, use_container_width=True, hide_index=True)
             else:
-                st.warning("対象となるデータがありません。")
+                st.warning("選択した条件に一致するデータがないため、チャートを表示できません。")
 
 # --- Streamlit UI ---
 def main():
