@@ -5,3 +5,5 @@ google-auth
 streamlit
 openpyxl
 python-docx
+pandas
+plotly

@@ -9,6 +9,10 @@ from google.genai import types
 import openpyxl
 from docx import Document as DocxDocument
 import copy
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
 
 # --- Configuration & Constants ---
 SERVICE_ACCOUNT_FILE = "service_account.json"
@@ -435,6 +439,125 @@ def build_row(extracted_data, row_number, mode="new", sheet=None, existing_row=N
             row.append(val if val is not None else "")
     return row
 
+# --- Dashboard Functions ---
+@st.cache_data(ttl=600)
+def load_historical_data(spreadsheet_id):
+    try:
+        sheet = get_sheet(spreadsheet_id)
+        data = sheet.get_all_values()
+        if not data:
+            return pd.DataFrame()
+        
+        headers = data[0]
+        # Clean headers to match COLUMN_LAYOUT if possible
+        df = pd.DataFrame(data[1:], columns=headers)
+        
+        # Ensure numeric columns are converted
+        numeric_cols = ["M_契約期間年数", "O_年間基本額上限", "V_必須配置人数", "AA_評価総点", "AB_価格点割合パーセント", "AC_企画事業内容配点", "AD_職員体制実績配点", "AE_安全管理危機管理配点", "AI_プレゼン時間分", "AK_人員確保難易度"]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col].replace('[\,円]', '', regex=True), errors='coerce')
+        
+        return df
+    except Exception as e:
+        st.error(f"データロードエラー: {e}")
+        return pd.DataFrame()
+
+def render_dashboard(df, spreadsheet_target):
+    if df.empty:
+        st.info("📊 まだデータがありません。解析・登録からデータを追加してください。")
+        return
+
+    st.subheader("📊 市場分析サマリー")
+    
+    # KPI metrics at the top
+    kpi1, kpi2, kpi3 = st.columns(3)
+    kpi1.metric("総案件数", f"{len(df)} 件")
+    
+    # Average budget (O_年間基本額上限)
+    if "O_年間基本額上限" in df.columns:
+        avg_budget = df["O_年間基本額上限"].mean()
+        if not pd.isna(avg_budget):
+            kpi2.metric("平均予算上限", f"¥{avg_budget:,.0f}")
+    
+    # Difficulty avg (AK_人員確保難易度)
+    if "AK_人員確保難易度" in df.columns:
+        avg_diff = df["AK_人員確保難易度"].mean()
+        if not pd.isna(avg_diff):
+            kpi3.metric("人員確保平均難易度", f"{avg_diff:.1f} / 5")
+
+    st.divider()
+
+    chart_col1, chart_col2 = st.columns(2)
+    
+    with chart_col1:
+        st.write("**施設区分別の比率**")
+        if "E_施設区分" in df.columns and not df["E_施設区分"].dropna().empty:
+            fig_pie = px.pie(df, names="E_施設区分", hole=.3, color_discrete_sequence=px.colors.qualitative.Pastel)
+            fig_pie.update_layout(margin=dict(t=0, b=0, l=0, r=0))
+            st.plotly_chart(fig_pie, use_container_width=True)
+        else:
+            st.caption("データ不足")
+
+    with chart_col2:
+        st.write("**年度別・施設区分の推移**")
+        if "AN_公募年度" in df.columns and "E_施設区分" in df.columns:
+            # Sort by year if possible
+            df_sorted = df.sort_values("AN_公募年度")
+            fig_bar = px.bar(df_sorted, x="AN_公募年度", color="E_施設区分", barmode="group", color_discrete_sequence=px.colors.qualitative.Safe)
+            fig_bar.update_layout(margin=dict(t=20, b=20, l=0, r=0))
+            st.plotly_chart(fig_bar, use_container_width=True)
+        else:
+            st.caption("データ不足")
+
+    st.divider()
+    
+    st.subheader("🧩 アセット・フィット分析 (Beta)")
+    st.write("保有している既存資産（保育園マニュアル等）と案件要件の適合性をイメージします。")
+    
+    fit_tab1, fit_tab2 = st.tabs(["📋 準備物・要件カタログ", "🎯 適合スコアリング"])
+    
+    with fit_tab1:
+        st.write("案件をまたいで「具体的に何を用意させられるのか」を検索できます。")
+        search_query = st.text_input("🔍 準備物リスト内を検索 (例: ICT, タブレット, 防災)", "")
+        
+        display_cols = ["C_自治体名", "D_案件名", "E_施設区分", "AP_物理的システム的準備リスト"]
+        # Ensure columns exist
+        available_cols = [c for c in display_cols if c in df.columns]
+        
+        if search_query:
+            mask = df["AP_物理的システム的準備リスト"].str.contains(search_query, case=False, na=False) | \
+                   df["AO_提案要求リスト"].str.contains(search_query, case=False, na=False)
+            filter_df = df[mask][available_cols]
+        else:
+            filter_df = df[available_cols].tail(10)
+        
+        st.dataframe(filter_df, use_container_width=True, hide_index=True)
+
+    with fit_tab2:
+        st.info("💡 現在、AIによる自動スコアリング機能を準備中です。")
+        st.write("現在は「提案要求」の傾向を表示しています（企画書の重み付け）。")
+        if "AO_提案要求リスト" in df.columns:
+            # Simple keyword count for visualization
+            keywords = {
+                "安全・防災": ["安全", "防災", "危機管理", "避難"],
+                "運営・方針": ["運営", "経営", "方針", "理念"],
+                "教育・学習": ["学習", "教育", "プログラム", "指導"],
+                "食育・おやつ": ["食", "おやつ", "アレルギー"],
+                "ICT・システム": ["ICT", "システム", "アプリ", "タブレット"]
+            }
+            
+            fit_stats = []
+            for label, kws in keywords.items():
+                count = df["AO_提案要求リスト"].str.contains("|".join(kws), case=False, na=False).sum()
+                fit_stats.append({"要素": label, "頻出度": count})
+            
+            fit_df = pd.DataFrame(fit_stats)
+            fig_radar = px.line_polar(fit_df, r="頻出度", theta="要素", line_close=True, markers=True)
+            fig_radar.update_traces(fill='toself')
+            st.plotly_chart(fig_radar, use_container_width=True)
+            st.caption("※過去の全案件（AO列）に出現するキーワードの割合です。")
+
 # --- Streamlit UI ---
 def main():
     st.set_page_config(page_title="自治体BPO案件解析システム", layout="wide", page_icon="logo.png")
@@ -488,378 +611,390 @@ def main():
             st.divider()
             st.info("Streamlit Cloudでデプロイする場合は Secrets に登録してください。")
 
-    # ========================================
-    # PHASE 1: Upload & Mode Selection
-    # ========================================
-    uploaded_files = st.file_uploader(
-        "📎 資料をすべてドロップ（PDF, Word, Excel, 画像 等）",
-        accept_multiple_files=True
-    )
+    tab_main, tab_dash = st.tabs(["📄 解析・登録", "📊 分析ダッシュボード"])
 
-    mode = st.radio(
-        "アップロードモード",
-        ["📦 モードA: すべて同じ案件です", "🔀 モードB: 複数の案件が混ざっています（AIが自動分類）"],
-        index=0,
-        help="モードA: 全ファイルを1つの案件として処理します。モードB: AIが案件ごとに自動分類します。"
-    )
-    is_mode_a = "モードA" in mode
+    with tab_main:
+        # ========================================
+        # PHASE 1: Upload & Mode Selection
+        # ========================================
+        uploaded_files = st.file_uploader(
+            "📎 資料をすべてドロップ（PDF, Word, Excel, 画像 等）",
+            accept_multiple_files=True
+        )
 
-    # Start button (only shown in upload phase)
-    if st.session_state.phase == "upload":
-        # Form-like wrapper to prevent accidental submissions
-        with st.form("upload_form"):
-            submit_button = st.form_submit_button("🚀 解析を開始")
-            
-        if submit_button and uploaded_files and api_key:
-            st.session_state.phase = "scanning"
-            st.session_state.groups = []
-            st.session_state.original_groups = []
-            st.session_state.extracted_results = []
-            st.session_state.summaries = []
-            
-            # Clean up old temp files
-            for p in st.session_state.temp_paths:
-                if os.path.exists(p):
-                    os.remove(p)
-            st.session_state.temp_paths = []
-            
-            # Deduplicate & save files immediately upon button click
-            temp_paths = []
-            seen_hashes = set()
-            skipped = []
-            
-            for i, uf in enumerate(uploaded_files):
-                fh = hashlib.md5(uf.getvalue()).hexdigest()
-                if fh in seen_hashes:
-                    skipped.append(uf.name)
-                    continue
-                seen_hashes.add(fh)
-                ext = os.path.splitext(uf.name)[1]
-                tp = f"temp_file_{i}{ext}"
-                with open(tp, "wb") as f:
-                    f.write(uf.getbuffer())
-                temp_paths.append(tp)
-            
-            st.session_state.temp_paths = temp_paths
-            if skipped:
-                st.session_state.skipped_files = skipped
-            else:
-                st.session_state.skipped_files = []
+        mode = st.radio(
+            "アップロードモード",
+            ["📦 モードA: すべて同じ案件です", "🔀 モードB: 複数の案件が混ざっています（AIが自動分類）"],
+            index=0,
+            help="モードA: 全ファイルを1つの案件として処理します。モードB: AIが案件ごとに自動分類します。"
+        )
+        is_mode_a = "モードA" in mode
+
+        # Start button (only shown in upload phase)
+        if st.session_state.phase == "upload":
+            # Form-like wrapper to prevent accidental submissions
+            with st.form("upload_form"):
+                submit_button = st.form_submit_button("🚀 解析を開始")
                 
-            st.rerun()
-
-    # ========================================
-    # PHASE 1.1: Scanning & Grouping
-    # ========================================
-    if st.session_state.phase == "scanning":
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        temp_paths = st.session_state.temp_paths
-        
-        if getattr(st.session_state, "skipped_files", []):
-            st.info(f"ℹ️ 重複スキップ: {', '.join(st.session_state.skipped_files)}")
-            
-        if not temp_paths:
-            st.warning("有効なファイルがありませんでした。")
-            if st.button("⬅️ アップロード画面に戻る"):
-                st.session_state.phase = "upload"
+            if submit_button and uploaded_files and api_key:
+                st.session_state.phase = "scanning"
+                st.session_state.groups = []
+                st.session_state.original_groups = []
+                st.session_state.extracted_results = []
+                st.session_state.summaries = []
+                
+                # Clean up old temp files
+                for p in st.session_state.temp_paths:
+                    if os.path.exists(p):
+                        os.remove(p)
+                st.session_state.temp_paths = []
+                
+                # Deduplicate & save files immediately upon button click
+                temp_paths = []
+                seen_hashes = set()
+                skipped = []
+                
+                for i, uf in enumerate(uploaded_files):
+                    fh = hashlib.md5(uf.getvalue()).hexdigest()
+                    if fh in seen_hashes:
+                        skipped.append(uf.name)
+                        continue
+                    seen_hashes.add(fh)
+                    ext = os.path.splitext(uf.name)[1]
+                    tp = f"temp_file_{i}{ext}"
+                    with open(tp, "wb") as f:
+                        f.write(uf.getbuffer())
+                    temp_paths.append(tp)
+                
+                st.session_state.temp_paths = temp_paths
+                if skipped:
+                    st.session_state.skipped_files = skipped
+                else:
+                    st.session_state.skipped_files = []
+                    
                 st.rerun()
-            st.stop()
-        
-        progress_bar.progress(0.05)
-        
-        if is_mode_a:
-            # MODE A: Skip scanning & grouping, treat all as one project
-            status_text.text("📦 モードA: すべて同じ案件として準備中...")
-            st.session_state.groups = [{
-                "group_name": f"アップロード案件（{len(temp_paths)}ファイル）",
-                "municipality": "",
-                "project_name": "",
-                "fiscal_year": "",
-                "file_indices": list(range(len(temp_paths)))
-            }]
-            progress_bar.progress(1.0)
-            status_text.text("準備完了しました。抽出に進みます。")
-            st.session_state.phase = "extracting"
-            st.rerun()
-        else:
-            # MODE B: Scan & Group
-            summaries = step1_scan_files(api_key, temp_paths, 
-                                         status_callback=lambda msg: status_text.text(msg))
-            st.session_state.summaries = summaries
-            progress_bar.progress(0.2)
+
+        # ========================================
+        # PHASE 1.1: Scanning & Grouping
+        # ========================================
+        if st.session_state.phase == "scanning":
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
-            with st.expander("📋 スキャン結果", expanded=False):
-                for s in summaries:
-                    st.write(f"**ファイル{s['file_index']}**: {s.get('municipality', '?')} / {s.get('project_name', '?')} / {s.get('fiscal_year', '?')} — {s.get('summary', '')}")
+            temp_paths = st.session_state.temp_paths
             
-            if len(temp_paths) == 1:
+            if getattr(st.session_state, "skipped_files", []):
+                st.info(f"ℹ️ 重複スキップ: {', '.join(st.session_state.skipped_files)}")
+                
+            if not temp_paths:
+                st.warning("有効なファイルがありませんでした。")
+                if st.button("⬅️ アップロード画面に戻る"):
+                    st.session_state.phase = "upload"
+                    st.rerun()
+                st.stop()
+            
+            progress_bar.progress(0.05)
+            
+            if is_mode_a:
+                # MODE A: Skip scanning & grouping, treat all as one project
+                status_text.text("📦 モードA: すべて同じ案件として準備中...")
                 st.session_state.groups = [{
-                    "group_name": f"{summaries[0].get('municipality', '')} {summaries[0].get('project_name', '')} ({summaries[0].get('fiscal_year', '')})",
-                    "municipality": summaries[0].get("municipality", ""),
-                    "project_name": summaries[0].get("project_name", ""),
-                    "fiscal_year": summaries[0].get("fiscal_year", ""),
-                    "file_indices": [0]
+                    "group_name": f"アップロード案件（{len(temp_paths)}ファイル）",
+                    "municipality": "",
+                    "project_name": "",
+                    "fiscal_year": "",
+                    "file_indices": list(range(len(temp_paths)))
                 }]
                 progress_bar.progress(1.0)
+                status_text.text("準備完了しました。抽出に進みます。")
                 st.session_state.phase = "extracting"
                 st.rerun()
             else:
-                status_text.text("🗂️ AIが案件ごとにグループ分け中...")
-                groups_result = step2_group_files(api_key, summaries)
-                st.session_state.groups = groups_result.get("groups", [])
-                st.session_state.original_groups = copy.deepcopy(st.session_state.groups)
-                progress_bar.progress(1.0)
-                status_text.text("グループ分け完了しました。確認してください。")
-                st.session_state.phase = "group_confirm"
-                st.rerun()
-
-    # ========================================
-    # PHASE 1.5: Group Confirm (Manual Merge)
-    # ========================================
-    if st.session_state.phase == "group_confirm":
-        st.divider()
-        st.subheader("🗂️ AIのグループ分け結果の確認")
-        st.write("同じ案件の資料はチェックを入れて「選択した案件を統合する」を押してください。")
-        
-        # Display current groups with checkboxes
-        selected_groups = []
-        for gi, g in enumerate(st.session_state.groups):
-            filenames = []
-            for idx in g["file_indices"]:
-                # Match index to original summary
-                for s in st.session_state.summaries:
-                    if s["file_index"] == idx:
-                        filenames.append(f"- ファイル{idx}: {s.get('summary', '')}")
-                        break
-            
-            with st.container(border=True):
-                col1, col2 = st.columns([1, 10])
-                with col1:
-                    is_selected = st.checkbox("選択", label_visibility="collapsed", key=f"grp_chk_{gi}_{st.session_state.chk_generation}")
-                    if is_selected:
-                        selected_groups.append(gi)
-                with col2:
-                    st.write(f"**{g['group_name']}** ({len(g['file_indices'])}ファイル)")
-                    for fn in filenames:
-                        st.caption(fn)
-
-        # Merge Actions
-        col_action1, col_action2 = st.columns([1, 3])
-        with col_action1:
-            if st.button("🔗 選択した案件を統合する"):
-                if len(selected_groups) >= 2:
-                    # Merge logic
-                    new_groups = []
-                    merged_indices = []
-                    merged_name = st.session_state.groups[selected_groups[0]]["group_name"] + " (統合)"
-                    
-                    for i, g in enumerate(st.session_state.groups):
-                        if i in selected_groups:
-                            merged_indices.extend(g["file_indices"])
-                        else:
-                            new_groups.append(g)
-                    
-                    # Add newly merged group
-                    new_groups.append({
-                        "group_name": merged_name,
-                        "municipality": st.session_state.groups[selected_groups[0]].get("municipality", ""),
-                        "project_name": st.session_state.groups[selected_groups[0]].get("project_name", ""),
-                        "fiscal_year": st.session_state.groups[selected_groups[0]].get("fiscal_year", ""),
-                        "file_indices": sorted(list(set(merged_indices)))
-                    })
-                    
-                    st.session_state.groups = new_groups
-                    
-                    # Force checkboxes to uncheck by changing their key generation
-                    st.session_state.chk_generation += 1
-                            
+                # MODE B: Scan & Group
+                summaries = step1_scan_files(api_key, temp_paths, 
+                                             status_callback=lambda msg: status_text.text(msg))
+                st.session_state.summaries = summaries
+                progress_bar.progress(0.2)
+                
+                with st.expander("📋 スキャン結果", expanded=False):
+                    for s in summaries:
+                        st.write(f"**ファイル{s['file_index']}**: {s.get('municipality', '?')} / {s.get('project_name', '?')} / {s.get('fiscal_year', '?')} — {s.get('summary', '')}")
+                
+                if len(temp_paths) == 1:
+                    st.session_state.groups = [{
+                        "group_name": f"{summaries[0].get('municipality', '')} {summaries[0].get('project_name', '')} ({summaries[0].get('fiscal_year', '')})",
+                        "municipality": summaries[0].get("municipality", ""),
+                        "project_name": summaries[0].get("project_name", ""),
+                        "fiscal_year": summaries[0].get("fiscal_year", ""),
+                        "file_indices": [0]
+                    }]
+                    progress_bar.progress(1.0)
+                    st.session_state.phase = "extracting"
                     st.rerun()
                 else:
-                    st.warning("統合するには2つ以上の案件を選択してください。")
-        with col_action2:
-            if st.button("🔄 グループ分けを最初（AIの提案）に戻す"):
-                st.session_state.groups = copy.deepcopy(st.session_state.original_groups)
-                # Force checkboxes to uncheck
-                st.session_state.chk_generation += 1
+                    status_text.text("🗂️ AIが案件ごとにグループ分け中...")
+                    groups_result = step2_group_files(api_key, summaries)
+                    st.session_state.groups = groups_result.get("groups", [])
+                    st.session_state.original_groups = copy.deepcopy(st.session_state.groups)
+                    progress_bar.progress(1.0)
+                    status_text.text("グループ分け完了しました。確認してください。")
+                    st.session_state.phase = "group_confirm"
+                    st.rerun()
+
+        # ========================================
+        # PHASE 1.5: Group Confirm (Manual Merge)
+        # ========================================
+        if st.session_state.phase == "group_confirm":
+            st.divider()
+            st.subheader("🗂️ AIのグループ分け結果の確認")
+            st.write("同じ案件の資料はチェックを入れて「選択した案件を統合する」を押してください。")
+            
+            # Display current groups with checkboxes
+            selected_groups = []
+            for gi, g in enumerate(st.session_state.groups):
+                filenames = []
+                for idx in g["file_indices"]:
+                    # Match index to original summary
+                    for s in st.session_state.summaries:
+                        if s["file_index"] == idx:
+                            filenames.append(f"- ファイル{idx}: {s.get('summary', '')}")
+                            break
+                
+                with st.container(border=True):
+                    col1, col2 = st.columns([1, 10])
+                    with col1:
+                        is_selected = st.checkbox("選択", label_visibility="collapsed", key=f"grp_chk_{gi}_{st.session_state.chk_generation}")
+                        if is_selected:
+                            selected_groups.append(gi)
+                    with col2:
+                        st.write(f"**{g['group_name']}** ({len(g['file_indices'])}ファイル)")
+                        for fn in filenames:
+                            st.caption(fn)
+
+            # Merge Actions
+            col_action1, col_action2 = st.columns([1, 3])
+            with col_action1:
+                if st.button("🔗 選択した案件を統合する"):
+                    if len(selected_groups) >= 2:
+                        # Merge logic
+                        new_groups = []
+                        merged_indices = []
+                        merged_name = st.session_state.groups[selected_groups[0]]["group_name"] + " (統合)"
+                        
+                        for i, g in enumerate(st.session_state.groups):
+                            if i in selected_groups:
+                                merged_indices.extend(g["file_indices"])
+                            else:
+                                new_groups.append(g)
+                        
+                        # Add newly merged group
+                        new_groups.append({
+                            "group_name": merged_name,
+                            "municipality": st.session_state.groups[selected_groups[0]].get("municipality", ""),
+                            "project_name": st.session_state.groups[selected_groups[0]].get("project_name", ""),
+                            "fiscal_year": st.session_state.groups[selected_groups[0]].get("fiscal_year", ""),
+                            "file_indices": sorted(list(set(merged_indices)))
+                        })
+                        
+                        st.session_state.groups = new_groups
+                        
+                        # Force checkboxes to uncheck by changing their key generation
+                        st.session_state.chk_generation += 1
+                                
+                        st.rerun()
+                    else:
+                        st.warning("統合するには2つ以上の案件を選択してください。")
+            with col_action2:
+                if st.button("🔄 グループ分けを最初（AIの提案）に戻す"):
+                    st.session_state.groups = copy.deepcopy(st.session_state.original_groups)
+                    # Force checkboxes to uncheck
+                    st.session_state.chk_generation += 1
+                    st.rerun()
+            
+            st.write("---")
+            if st.button("🚀 このグループで本格抽出を開始する", type="primary"):
+                st.session_state.phase = "extracting"
                 st.rerun()
-        
-        st.write("---")
-        if st.button("🚀 このグループで本格抽出を開始する", type="primary"):
-            st.session_state.phase = "extracting"
-            st.rerun()
+                
+        # ========================================
+        # PHASE 1.8: Extracting Data
+        # ========================================
+        if st.session_state.phase == "extracting":
+            st.divider()
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
-    # ========================================
-    # PHASE 1.8: Extracting Data
-    # ========================================
-    if st.session_state.phase == "extracting":
-        st.divider()
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Check existing data
-        with st.status("既存データとの照合中...", expanded=False) as status:
-            sheet = get_sheet(st.secrets["GSHEET_ID"])
-            annotated = step3_check_existing(api_key, sheet, st.session_state.groups)
-            status.update(label="照合完了！", state="complete")
-        
-        progress_bar.progress(0.1)
-        
-        # Extract data for each group
-        all_results = []
-        for gi, group in enumerate(annotated):
-            gname = group.get("group_name", f"案件{gi+1}")
-            file_indices = group.get("file_indices", [])
-            gpaths = [st.session_state.temp_paths[idx] for idx in file_indices if idx < len(st.session_state.temp_paths)]
+            # Check existing data
+            with st.status("既存データとの照合中...", expanded=False) as status:
+                sheet = get_sheet(st.secrets["GSHEET_ID"])
+                annotated = step3_check_existing(api_key, sheet, st.session_state.groups)
+                status.update(label="照合完了！", state="complete")
             
-            if not gpaths:
-                continue
+            progress_bar.progress(0.1)
             
-            status_text.text(f"🧠 解析中: [{gi+1}/{len(annotated)}] {gname}...")
-            
-            existing_data = None
-            if group["mode"] == "update" and group.get("existing_row"):
+            # Extract data for each group
+            all_results = []
+            for gi, group in enumerate(annotated):
+                gname = group.get("group_name", f"案件{gi+1}")
+                file_indices = group.get("file_indices", [])
+                gpaths = [st.session_state.temp_paths[idx] for idx in file_indices if idx < len(st.session_state.temp_paths)]
+                
+                if not gpaths:
+                    continue
+                
+                status_text.text(f"🧠 解析中: [{gi+1}/{len(annotated)}] {gname}...")
+                
+                existing_data = None
+                if group["mode"] == "update" and group.get("existing_row"):
+                    try:
+                        row_vals = sheet.row_values(group["existing_row"])
+                        existing_data = {}
+                        for ci, col in enumerate(COLUMN_LAYOUT):
+                            if ci < len(row_vals) and row_vals[ci]:
+                                existing_data[col] = row_vals[ci]
+                    except Exception:
+                        pass
+                
                 try:
-                    row_vals = sheet.row_values(group["existing_row"])
-                    existing_data = {}
-                    for ci, col in enumerate(COLUMN_LAYOUT):
-                        if ci < len(row_vals) and row_vals[ci]:
-                            existing_data[col] = row_vals[ci]
-                except Exception:
-                    pass
+                    extracted = step4_extract_data(api_key, gpaths, existing_data)
+                    all_results.append({
+                        "group": group,
+                        "data": extracted,
+                        "group_name": gname
+                    })
+                except Exception as e:
+                    st.error(f"❌ {gname} の解析エラー: {str(e)}")
+                
+                progress_bar.progress(0.1 + (0.9 * (gi + 1) / len(annotated)))
+            
+            st.session_state.extracted_results = all_results
+            st.session_state.phase = "confirm"
+            status_text.text("解析完了！以下のプレビューを確認してください。")
+            st.rerun()
+
+        # ========================================
+        # PHASE 2: Preview & Confirm
+        # ========================================
+        if st.session_state.phase == "confirm" and st.session_state.extracted_results:
+            st.divider()
+            st.subheader("📊 抽出データのプレビュー")
+            st.write("登録する案件にチェックを入れて「登録する」ボタンを押してください。")
+            
+            selected_results_to_write = []
+            for ri, result in enumerate(st.session_state.extracted_results):
+                group = result["group"]
+                data = result["data"]
+                gname = result["group_name"]
+                mode_label = "🔄 更新" if group["mode"] == "update" else "🆕 新規"
+                row_label = f"（行 {group['existing_row']}）" if group.get("existing_row") else ""
+                
+                with st.container(border=True):
+                    c_chk, c_exp = st.columns([1, 15])
+                    with c_chk:
+                        do_register = st.checkbox("登録", value=True, key=f"reg_chk_{ri}", label_visibility="collapsed")
+                        if do_register:
+                            selected_results_to_write.append(result)
+                    with c_exp:
+                        with st.expander(f"{mode_label} {gname} {row_label}", expanded=False):
+                            # Show data as a clean table
+                            preview_data = {}
+                            for col in COLUMN_LAYOUT:
+                                if col in ("A_No", "G_ステータス"):
+                                    continue
+                                display_name = DISPLAY_COLS.get(col, col)
+                                val = data.get(col, "")
+                                if val is not None and val != "":
+                                    preview_data[display_name] = str(val)
+                            
+                            if preview_data:
+                                col1, col2 = st.columns(2)
+                                items = list(preview_data.items())
+                                mid = (len(items) + 1) // 2
+                                with col1:
+                                    for k, v in items[:mid]:
+                                        st.write(f"**{k}**: {v}")
+                                with col2:
+                                    for k, v in items[mid:]:
+                                        st.write(f"**{k}**: {v}")
+                            else:
+                                st.warning("データが抽出されませんでした。")
+            
+            col_confirm, col_cancel = st.columns(2)
+            with col_confirm:
+                if st.button("✅ チェックした内容で登録する", type="primary"):
+                    if not selected_results_to_write:
+                        st.warning("登録する案件を少なくとも1つ選択してください。")
+                    else:
+                        st.session_state.final_selection = selected_results_to_write
+                        st.session_state.phase = "writing"
+                        st.rerun()
+            with col_cancel:
+                if st.button("❌ キャンセル"):
+                    # Cleanup
+                    for p in st.session_state.temp_paths:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    st.session_state.phase = "upload"
+                    st.session_state.extracted_results = []
+                    st.session_state.temp_paths = []
+                    st.rerun()
+
+        # ========================================
+        # PHASE 3: Write to Sheet
+        # ========================================
+        if st.session_state.phase == "writing":
+            st.divider()
+            status_text = st.empty()
+            status_text.text("📝 スプレッドシートへ書き込み中...")
             
             try:
-                extracted = step4_extract_data(api_key, gpaths, existing_data)
-                all_results.append({
-                    "group": group,
-                    "data": extracted,
-                    "group_name": gname
-                })
-            except Exception as e:
-                st.error(f"❌ {gname} の解析エラー: {str(e)}")
-            
-            progress_bar.progress(0.1 + (0.9 * (gi + 1) / len(annotated)))
-        
-        st.session_state.extracted_results = all_results
-        st.session_state.phase = "confirm"
-        status_text.text("解析完了！以下のプレビューを確認してください。")
-        st.rerun()
-
-    # ========================================
-    # PHASE 2: Preview & Confirm
-    # ========================================
-    if st.session_state.phase == "confirm" and st.session_state.extracted_results:
-        st.divider()
-        st.subheader("📊 抽出データのプレビュー")
-        st.write("登録する案件にチェックを入れて「登録する」ボタンを押してください。")
-        
-        selected_results_to_write = []
-        for ri, result in enumerate(st.session_state.extracted_results):
-            group = result["group"]
-            data = result["data"]
-            gname = result["group_name"]
-            mode_label = "🔄 更新" if group["mode"] == "update" else "🆕 新規"
-            row_label = f"（行 {group['existing_row']}）" if group.get("existing_row") else ""
-            
-            with st.container(border=True):
-                c_chk, c_exp = st.columns([1, 15])
-                with c_chk:
-                    do_register = st.checkbox("登録", value=True, key=f"reg_chk_{ri}", label_visibility="collapsed")
-                    if do_register:
-                        selected_results_to_write.append(result)
-                with c_exp:
-                    with st.expander(f"{mode_label} {gname} {row_label}", expanded=False):
-                        # Show data as a clean table
-                        preview_data = {}
-                        for col in COLUMN_LAYOUT:
-                            if col in ("A_No", "G_ステータス"):
-                                continue
-                            display_name = DISPLAY_COLS.get(col, col)
-                            val = data.get(col, "")
-                            if val is not None and val != "":
-                                preview_data[display_name] = str(val)
-                        
-                        if preview_data:
-                            col1, col2 = st.columns(2)
-                            items = list(preview_data.items())
-                            mid = (len(items) + 1) // 2
-                            with col1:
-                                for k, v in items[:mid]:
-                                    st.write(f"**{k}**: {v}")
-                            with col2:
-                                for k, v in items[mid:]:
-                                    st.write(f"**{k}**: {v}")
+                sheet = get_sheet(spreadsheet_target)
+                all_values = sheet.col_values(1)
+                next_no = len([v for v in all_values[1:] if str(v).strip()]) + 1
+                
+                success_count = 0
+                to_process = getattr(st.session_state, "final_selection", st.session_state.extracted_results)
+                
+                for result in to_process:
+                    group = result["group"]
+                    data = result["data"]
+                    gname = result["group_name"]
+                    
+                    row = build_row(data, next_no, group["mode"], sheet, group.get("existing_row"))
+                    
+                    try:
+                        step5_write_to_sheet(sheet, row, group["mode"], group.get("existing_row"))
+                        if group["mode"] == "update":
+                            st.success(f"🔄 {gname} → 行 {group['existing_row']} を更新しました")
                         else:
-                            st.warning("データが抽出されませんでした。")
-        
-        col_confirm, col_cancel = st.columns(2)
-        with col_confirm:
-            if st.button("✅ チェックした内容で登録する", type="primary"):
-                if not selected_results_to_write:
-                    st.warning("登録する案件を少なくとも1つ選択してください。")
-                else:
-                    st.session_state.final_selection = selected_results_to_write
-                    st.session_state.phase = "writing"
-                    st.rerun()
-        with col_cancel:
-            if st.button("❌ キャンセル"):
-                # Cleanup
+                            st.success(f"🆕 {gname} → 行 {next_no} に新規登録しました")
+                            next_no += 1
+                        success_count += 1
+                    except Exception as e:
+                        st.error(f"❌ {gname} の書き込みエラー: {str(e)}")
+                
+                if success_count > 0:
+                    st.balloons()
+                    st.success(f"🎉 合計 {success_count} 件の処理が完了しました！")
+                    st.cache_data.clear()
+            
+            except Exception as e:
+                st.error(f"❌ エラー: {str(e)}")
+            finally:
                 for p in st.session_state.temp_paths:
                     if os.path.exists(p):
                         os.remove(p)
                 st.session_state.phase = "upload"
                 st.session_state.extracted_results = []
                 st.session_state.temp_paths = []
-                st.rerun()
 
-    # ========================================
-    # PHASE 3: Write to Sheet
-    # ========================================
-    if st.session_state.phase == "writing":
-        st.divider()
-        status_text = st.empty()
-        status_text.text("📝 スプレッドシートへ書き込み中...")
-        
-        try:
-            sheet = get_sheet(spreadsheet_target)
-            all_values = sheet.col_values(1)
-            next_no = len([v for v in all_values[1:] if str(v).strip()]) + 1
-            
-            success_count = 0
-            to_process = getattr(st.session_state, "final_selection", st.session_state.extracted_results)
-            
-            for result in to_process:
-                group = result["group"]
-                data = result["data"]
-                gname = result["group_name"]
-                
-                row = build_row(data, next_no, group["mode"], sheet, group.get("existing_row"))
-                
-                try:
-                    step5_write_to_sheet(sheet, row, group["mode"], group.get("existing_row"))
-                    if group["mode"] == "update":
-                        st.success(f"🔄 {gname} → 行 {group['existing_row']} を更新しました")
-                    else:
-                        st.success(f"🆕 {gname} → 行 {next_no} に新規登録しました")
-                        next_no += 1
-                    success_count += 1
-                except Exception as e:
-                    st.error(f"❌ {gname} の書き込みエラー: {str(e)}")
-            
-            if success_count > 0:
-                st.balloons()
-                st.success(f"🎉 合計 {success_count} 件の処理が完了しました！")
-        
-        except Exception as e:
-            st.error(f"❌ エラー: {str(e)}")
-        finally:
-            for p in st.session_state.temp_paths:
-                if os.path.exists(p):
-                    os.remove(p)
-            st.session_state.phase = "upload"
-            st.session_state.extracted_results = []
-            st.session_state.temp_paths = []
+    with tab_dash:
+        if api_key:
+            with st.spinner("データを読み込み中..."):
+                df = load_historical_data(spreadsheet_target)
+            render_dashboard(df, spreadsheet_target)
+        else:
+            st.warning("APIキーとスプレッドシートの設定を完了してください。")
 
 if __name__ == "__main__":
     main()
