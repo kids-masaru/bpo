@@ -504,36 +504,102 @@ def load_historical_data(spreadsheet_id):
         st.error(f"データロードエラー: {e}")
         return pd.DataFrame()
 
+def generate_ai_summary(df):
+    try:
+        req_texts = df["AO_提案要求リスト"].dropna().astype(str).tolist() if "AO_提案要求リスト" in df.columns else []
+        prep_texts = df["AP_物理的システム的準備リスト"].dropna().astype(str).tolist() if "AP_物理的システム的準備リスト" in df.columns else []
+        
+        # Limit the number of texts to avoid hitting token limits
+        import random
+        if len(req_texts) > 100: req_texts = random.sample(req_texts, 100)
+        if len(prep_texts) > 100: prep_texts = random.sample(prep_texts, 100)
+        
+        req_combined = "\n".join(req_texts)
+        prep_combined = "\n".join(prep_texts)
+        
+        prompt = f"""
+あなたは自治体BPO業務（学童・児童館・保育所など）の仕様書のプロフェッショナルです。
+以下の「提案要求リスト」と「準備物リスト」のテキストデータをすべて読み込み、共通する要素を抽出し、近似しているものを分かりやすくグルーピングして箇条書きでまとめてください。
+
+【出力要件】
+1. 完全一致にこだわらず、「似たような意味・目的」のものを大項目としてまとめてください（例：「安全管理」「運営体制」「ICT」など）。
+2. 出現頻度が多い・重要度が高いと思われるものから順に並べてください。
+3. （X/226）のような数字の表記は不要です。「◯◯が強く求められている傾向にある」といったニュアンスが伝わるように箇条書きにしてください。
+4. 「提案要求リストのまとめ」と「準備物リストのまとめ」の見出しをつけて分けて出力してください。
+
+【提案要求リストのデータ】
+{req_combined}
+
+【準備物リストのデータ】
+{prep_combined}
+"""
+        client = genai.Client(api_key=st.secrets.get("GEMINI_API_KEY", ""))
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        return f"AI要約の生成に失敗しました: {e}"
+
 def render_dashboard(df, spreadsheet_target):
     if df.empty:
         st.info("📊 まだデータがありません。解析・登録からデータを追加してください。")
         return
 
-    st.subheader("📊 施設区分別の傾向比較")
+    st.subheader("📊 施設ごとの市場データ")
+    st.markdown("##### 🔍 市場データの絞り込み")
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    
+    market_df = df.copy()
+    
+    with filter_col1:
+        if "AN_公募年度" in market_df.columns:
+            years = sorted([str(x) for x in market_df["AN_公募年度"].dropna().unique() if x], reverse=True)
+            selected_years = st.multiselect("公募年度", years, default=years)
+            if selected_years:
+                market_df = market_df[market_df["AN_公募年度"].astype(str).isin(selected_years)]
+                
+    with filter_col2:
+        if "F_契約形態" in market_df.columns:
+            forms = sorted([str(x) for x in market_df["F_契約形態"].dropna().unique() if x])
+            selected_forms = st.multiselect("契約形態", forms, default=forms)
+            if selected_forms:
+                market_df = market_df[market_df["F_契約形態"].astype(str).isin(selected_forms)]
+                
+    with filter_col3:
+        if "E_施設区分" in market_df.columns:
+            facilities = sorted([str(x) for x in market_df["E_施設区分"].dropna().unique() if x])
+            selected_facilities = st.multiselect("施設区分", facilities, default=facilities)
+            if selected_facilities:
+                market_df = market_df[market_df["E_施設区分"].astype(str).isin(selected_facilities)]
+
+    st.write("---")
     
     kpi1, kpi2, kpi3 = st.columns(3)
-    kpi1.metric("読み込み済み総案件数", f"{len(df)} 件")
+    kpi1.metric("該当する案件数", f"{len(market_df)} 件")
     
-    if "O_年間基本額上限" in df.columns:
-        avg_budget = df["O_年間基本額上限"].mean()
+    if "O_年間基本額上限" in market_df.columns:
+        avg_budget = market_df["O_年間基本額上限"].mean()
         if not pd.isna(avg_budget):
-            kpi2.metric("全体平均予算上限", f"¥{avg_budget:,.0f}")
+            kpi2.metric("平均予算上限", f"¥{avg_budget:,.0f}")
+        else:
+            kpi2.metric("平均予算上限", "-")
     
-    if "AK_人員確保難易度" in df.columns:
-        avg_diff = df["AK_人員確保難易度"].mean()
+    if "AK_人員確保難易度" in market_df.columns:
+        avg_diff = market_df["AK_人員確保難易度"].mean()
         if not pd.isna(avg_diff):
-            kpi3.metric("全体平均 人員確保難易度", f"{avg_diff:.1f}")
-
-    st.divider()
+            kpi3.metric("平均人員確保難易度", f"{avg_diff:.1f}")
+        else:
+            kpi3.metric("平均人員確保難易度", "-")
 
     # Facility Comparison
-    if "E_施設区分" in df.columns:
-        st.write("### 🏢 施設ごとの市場データ")
+    if "E_施設区分" in market_df.columns:
         # Filter out empty facility types
-        df_facilities = df[df["E_施設区分"].notna() & (df["E_施設区分"] != "")]
+        df_facilities = market_df[market_df["E_施設区分"].notna() & (market_df["E_施設区分"] != "")]
         
         if not df_facilities.empty:
-            # 1. Row of Charts: Pie Chart (smaller) + Top Municipalities + Yearly Trend
+            # 1. Row of Charts: Pie Chart (smaller) + Top Municipalities + Contract Length
             chart_col1, chart_col2, chart_col3 = st.columns([1, 1.2, 1.2])
             
             with chart_col1:
@@ -547,36 +613,38 @@ def render_dashboard(df, spreadsheet_target):
                 st.plotly_chart(fig_pie, use_container_width=True)
             
             with chart_col2:
-                if "C_自治体名" in df.columns:
+                if "C_自治体名" in market_df.columns:
                     st.write("**案件が多い自治体 トップ10**")
                     muni_data = df_facilities["C_自治体名"].replace("null", pd.NA).dropna()
                     muni_data = muni_data[muni_data.str.strip() != ""]
-                    top_muni = muni_data.value_counts().head(10).reset_index()
-                    top_muni.columns = ["自治体名", "案件数"]
-                    # Horizontal bar chart, sorted ascending so largest is at top
-                    fig_muni = px.bar(top_muni.sort_values("案件数", ascending=True), 
-                                      x="案件数", y="自治体名", orientation='h')
-                    fig_muni.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
-                    st.plotly_chart(fig_muni, use_container_width=True)
+                    if not muni_data.empty:
+                        top_muni = muni_data.value_counts().head(10).reset_index()
+                        top_muni.columns = ["自治体名", "案件数"]
+                        # Horizontal bar chart, sorted ascending so largest is at top
+                        fig_muni = px.bar(top_muni.sort_values("案件数", ascending=True), 
+                                          x="案件数", y="自治体名", orientation='h')
+                        fig_muni.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
+                        st.plotly_chart(fig_muni, use_container_width=True)
 
             with chart_col3:
-                if "AN_公募年度" in df.columns:
-                    st.write("**年度別・施設区分の案件推移**")
-                    yearly_df = df_facilities.groupby(["AN_公募年度", "E_施設区分"]).size().reset_index(name="案件数")
-                    yearly_df = yearly_df.sort_values("AN_公募年度")
-                    fig_bar = px.bar(yearly_df, x="AN_公募年度", y="案件数", color="E_施設区分", barmode="group")
-                    fig_bar.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300, legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5))
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                if "M_契約期間年数" in market_df.columns:
+                    st.write("**契約年数の分布**")
+                    lengths_s = df_facilities["M_契約期間年数"].dropna()
+                    if not lengths_s.empty:
+                        lengths_df = lengths_s.astype(int).value_counts().reset_index()
+                        lengths_df.columns = ["契約年数", "案件数"]
+                        lengths_df["契約年数"] = lengths_df["契約年数"].astype(str) + "年"
+                        fig_bar = px.bar(lengths_df.sort_values("契約年数"), x="契約年数", y="案件数")
+                        fig_bar.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
+                        st.plotly_chart(fig_bar, use_container_width=True)
 
             # 2. Summary Table of Averages
             st.write("**施設区分別の平均指標**")
             agg_dict = {}
-            if "O_年間基本額上限" in df.columns:
+            if "O_年間基本額上限" in market_df.columns:
                 agg_dict["O_年間基本額上限"] = "mean"
-            if "V_必須配置人数" in df.columns:
-                agg_dict["V_必須配置人数"] = "mean"
-            if "AA_評価総点" in df.columns:
-                agg_dict["AA_評価総点"] = "mean"
+            if "M_契約期間年数" in market_df.columns:
+                agg_dict["M_契約期間年数"] = "mean"
                 
             if agg_dict:
                 grouped = df_facilities.groupby("E_施設区分").agg(agg_dict).reset_index()
@@ -584,58 +652,24 @@ def render_dashboard(df, spreadsheet_target):
                 display_grouped["施設区分"] = grouped["E_施設区分"]
                 if "O_年間基本額上限" in grouped.columns:
                     display_grouped["平均 年間基本額上限(円)"] = grouped["O_年間基本額上限"].apply(lambda x: f"¥{x:,.0f}" if pd.notna(x) else "-")
-                if "V_必須配置人数" in grouped.columns:
-                    display_grouped["平均 必須配置人数"] = grouped["V_必須配置人数"].apply(lambda x: f"{x:.1f}人" if pd.notna(x) else "-")
-                if "AA_評価総点" in grouped.columns:
-                    display_grouped["平均 評価総点"] = grouped["AA_評価総点"].apply(lambda x: f"{x:.1f}点" if pd.notna(x) else "-")
+                if "M_契約期間年数" in grouped.columns:
+                    display_grouped["平均 契約期間年数"] = grouped["M_契約期間年数"].apply(lambda x: f"{x:.1f}年" if pd.notna(x) else "-")
                 st.dataframe(display_grouped, use_container_width=True, hide_index=True)
 
     st.divider()
     
-    st.subheader("📋 提案要求・準備物 カタログ")
-    st.write("過去の案件で実際に求められた事項を網羅的に確認し、社内の既存アセット（保育園マニュアル等）の適応可否を判断するための材料です。")
-    
-    # Global filter for the entire Catalog section (improves UX)
-    st.markdown("##### 🔍 全体絞り込み")
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-         facility_filter = "すべて"
-         if "E_施設区分" in df.columns:
-             options = ["すべて"] + sorted([str(x) for x in df["E_施設区分"].dropna().unique() if x])
-             facility_filter = st.selectbox("対象の施設区分を選択", options)
-    with col_f2:
-         search_query = st.text_input("キーワード検索 (例: 研修, 防災, タブレット)", "")
+    st.subheader("📋 提案要求・準備物 カタログ (全体傾向)")
+    st.write("過去の案件で実際に求められた事項を全データから網羅的に確認し、社内の既存アセットの適応可否を判断するための材料です。")
+    st.write("※ このセクションのデータは、全体傾向をつかむためにフィルター条件の影響を受けません。")
     
     st.write("") # Spacing
     
-    cat_tab1, cat_tab2 = st.tabs(["📑 要求事項の一覧表", "📈 要素別 出現頻度（レーダーチャート）"])
+    cat_tab1, cat_tab2, cat_tab3 = st.tabs(["📈 要素別 出現頻度（レーダーチャート）", "🤖 要求リスト(AIまとめ)", "📑 要求事項の一覧表"])
     
-    # Apply filters
-    filter_df = df.copy()
-    if facility_filter != "すべて" and "E_施設区分" in filter_df.columns:
-         filter_df = filter_df[filter_df["E_施設区分"] == facility_filter]
-         
-    if search_query:
-         mask1 = False
-         mask2 = False
-         if "AP_物理的システム的準備リスト" in filter_df.columns:
-              mask1 = filter_df["AP_物理的システム的準備リスト"].astype(str).str.contains(search_query, case=False, na=False)
-         if "AO_提案要求リスト" in filter_df.columns:
-              mask2 = filter_df["AO_提案要求リスト"].astype(str).str.contains(search_query, case=False, na=False)
-         filter_df = filter_df[mask1 | mask2]
+    filter_df = df.copy() # Use all data, ignoring market filters
     
     with cat_tab1:
-        st.write(f"**詳細データ一覧 ({len(filter_df)}件)**")
-        display_cols = ["C_自治体名", "D_案件名", "E_施設区分", "AO_提案要求リスト", "AP_物理的システム的準備リスト"]
-        available_cols = [c for c in display_cols if c in df.columns]
-        
-        display_raw_df = filter_df[available_cols].copy()
-        display_raw_df = display_raw_df.rename(columns=DISPLAY_COLS)
-        st.dataframe(display_raw_df, use_container_width=True, hide_index=True)
-
-    with cat_tab2:
         st.write("主要なキーワードが「提案要求・準備物」の中にどれくらい出現しているかを集計します。")
-        st.write("※ 選択した施設区分で、特に注力すべき重点ポイント（安全、ICTなど）を視覚化します。")
         
         if "AO_提案要求リスト" in df.columns or "AP_物理的システム的準備リスト" in df.columns:
             keywords = {
@@ -673,14 +707,47 @@ def render_dashboard(df, spreadsheet_target):
                     
                     fig_radar = px.line_polar(plot_df, r="割合", theta="要素", line_close=True, markers=True,
                                               hover_data=["出現件数"],
-                                              title=f"{facility_filter}の要求キーワード分布",
+                                              title=f"全体の要求キーワード分布",
                                               range_r=[0, 100])
                     fig_radar.update_traces(fill='toself')
                     st.plotly_chart(fig_radar, use_container_width=True)
                 with col_chart2:
                     st.dataframe(fit_df, use_container_width=True, hide_index=True)
             else:
-                st.warning("選択した条件に一致するデータがないため、チャートを表示できません。")
+                st.warning("対象となるデータがありません。")
+
+    with cat_tab2:
+        st.write("全ての案件データから、共通の要求事項や準備物をAIが近似でグルーピングしてまとめます。")
+        CACHE_PATH = "ai_catalog_summary_cache.txt"
+        
+        col_btn1, col_btn2 = st.columns([1, 4])
+        with col_btn1:
+            if st.button("🚀 まとめを生成・更新する"):
+                with st.spinner("AIが要約を生成しています... (約数十秒かかります)"):
+                    summary_result = generate_ai_summary(filter_df)
+                    try:
+                        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+                            f.write(summary_result)
+                        st.success("まとめを更新しました！")
+                    except Exception as err:
+                        st.error(f"保存に失敗しました: {err}")
+        
+        if os.path.exists(CACHE_PATH):
+            with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                cached_text = f.read()
+            st.markdown(f"> *最後に生成されたまとめ結果を表示しています。*")
+            st.info(cached_text)
+        else:
+            st.info("💡 まだAIによるまとめが生成されていません。「まとめを生成・更新する」ボタンを押してください。")
+
+    with cat_tab3:
+        st.write(f"**詳細データ一覧 ({len(filter_df)}件)**")
+        display_cols = ["C_自治体名", "D_案件名", "E_施設区分", "AO_提案要求リスト", "AP_物理的システム的準備リスト"]
+        available_cols = [c for c in display_cols if c in df.columns]
+        
+        display_raw_df = filter_df[available_cols].copy()
+        display_raw_df = display_raw_df.rename(columns=DISPLAY_COLS)
+        st.dataframe(display_raw_df, use_container_width=True, hide_index=True)
 
 # --- Streamlit UI ---
 def main():
