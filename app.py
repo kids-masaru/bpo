@@ -518,14 +518,28 @@ def generate_ai_summary(df):
         prep_combined = "\n".join(prep_texts)
         
         prompt = f"""
-あなたは自治体BPO業務（学童・児童館・保育所など）の仕様書のプロフェッショナルです。
-以下の「提案要求リスト」と「準備物リスト」のテキストデータをすべて読み込み、共通する要素を抽出し、近似しているものを分かりやすくグルーピングして箇条書きでまとめてください。
+あなたは自治体BPO業務（学童・児童館・保育所など）の仕様書の要約システムです。
+以下の「提案要求リスト」と「準備物リスト」のテキストデータを読み込み、共通要素を抽出してグループ化してください。
 
 【出力要件】
-1. 完全一致にこだわらず、「似たような意味・目的」のものを大項目としてまとめてください（例：「安全管理」「運営体制」「ICT」など）。
-2. 出現頻度が多い・重要度が高いと思われるものから順に並べてください。
-3. （X/226）のような数字の表記は不要です。「◯◯が強く求められている傾向にある」といったニュアンスが伝わるように箇条書きにしてください。
-4. 「提案要求リストのまとめ」と「準備物リストのまとめ」の見出しをつけて分けて出力してください。
+1. 挨拶や「まとめました」などの余計な文章は絶対に含めないでください。
+2. （X/226）のような数字の表記は不要です。
+3. 必ず以下のJSONフォーマットのみを厳格に出力してください。マークダウンブロック(```json)も含めないでください。
+
+[
+  {{
+    "title": "提案要求リストのまとめ",
+    "groups": [
+      {{ "group_name": "大項目名（例：運営方針・理念・事業計画）", "details": ["具体的な内容1", "具体的な内容2"] }}
+    ]
+  }},
+  {{
+    "title": "準備物リストのまとめ",
+    "groups": [
+      {{ "group_name": "大項目名", "details": ["具体的な内容1"] }}
+    ]
+  }}
+]
 
 【提案要求リストのデータ】
 {req_combined}
@@ -538,9 +552,16 @@ def generate_ai_summary(df):
             model='gemini-2.5-flash',
             contents=prompt,
         )
-        return response.text
+        res_text = response.text.strip()
+        if res_text.startswith("```json"):
+            res_text = res_text[7:]
+        if res_text.startswith("```"):
+            res_text = res_text[3:]
+        if res_text.endswith("```"):
+            res_text = res_text[:-3]
+        return res_text.strip()
     except Exception as e:
-        return f"AI要約の生成に失敗しました: {e}"
+        return f'{{"error": "AI要約の生成に失敗しました: {e}"}}'
 
 def render_dashboard(df, spreadsheet_target):
     if df.empty:
@@ -576,7 +597,7 @@ def render_dashboard(df, spreadsheet_target):
 
     st.write("---")
     
-    kpi1, kpi2, kpi3 = st.columns(3)
+    kpi1, kpi2 = st.columns(2)
     kpi1.metric("該当する案件数", f"{len(market_df)} 件")
     
     if "O_年間基本額上限" in market_df.columns:
@@ -585,13 +606,6 @@ def render_dashboard(df, spreadsheet_target):
             kpi2.metric("平均予算上限", f"¥{avg_budget:,.0f}")
         else:
             kpi2.metric("平均予算上限", "-")
-    
-    if "AK_人員確保難易度" in market_df.columns:
-        avg_diff = market_df["AK_人員確保難易度"].mean()
-        if not pd.isna(avg_diff):
-            kpi3.metric("平均人員確保難易度", f"{avg_diff:.1f}")
-        else:
-            kpi3.metric("平均人員確保難易度", "-")
 
     # Facility Comparison
     if "E_施設区分" in market_df.columns:
@@ -599,43 +613,84 @@ def render_dashboard(df, spreadsheet_target):
         df_facilities = market_df[market_df["E_施設区分"].notna() & (market_df["E_施設区分"] != "")]
         
         if not df_facilities.empty:
+            plot_df = df_facilities.copy()
+            
+            # Helper to create hover list
+            def build_hover_list(series, max_items=5):
+                lst = series.dropna().astype(str).tolist()
+                if not lst: return "案件名なし"
+                if len(lst) > max_items:
+                    return "<br>".join([f"・{n}" for n in lst[:max_items]]) + f"<br>...ほか{len(lst)-max_items}件"
+                return "<br>".join([f"・{n}" for n in lst])
+
             # 1. Row of Charts: Pie Chart (smaller) + Top Municipalities + Contract Length
             chart_col1, chart_col2, chart_col3 = st.columns([1, 1.2, 1.2])
             
             with chart_col1:
                 st.write("**施設区分別の案件割合**")
-                count_df = df_facilities["E_施設区分"].value_counts().reset_index()
-                count_df.columns = ["施設区分", "案件数"]
-                # Adjusting layout to be smaller and tighter
-                fig_pie = px.pie(count_df, names="施設区分", values="案件数", hole=.4)
-                fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300, showlegend=False)
-                fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-                st.plotly_chart(fig_pie, use_container_width=True)
+                if "E_施設区分" in plot_df.columns:
+                    grouped_pie = plot_df.groupby("E_施設区分").agg(
+                        案件数=("E_施設区分", "size"),
+                        案件リスト=("D_案件名", lambda x: build_hover_list(x))
+                    ).reset_index()
+                    fig_pie = px.pie(grouped_pie, names="E_施設区分", values="案件数", custom_data=["案件リスト"], hole=.4)
+                    fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=380, showlegend=False, hoverlabel=dict(align="left"))
+                    fig_pie.update_traces(
+                        textposition='inside', 
+                        textinfo='percent+label',
+                        hovertemplate="<b>%{label}</b><br>案件数: %{value}件<br><br>【主な案件】<br>%{customdata[0]}<extra></extra>"
+                    )
+                    st.plotly_chart(fig_pie, use_container_width=True)
             
             with chart_col2:
-                if "C_自治体名" in market_df.columns:
-                    st.write("**案件が多い自治体 トップ10**")
-                    muni_data = df_facilities["C_自治体名"].replace("null", pd.NA).dropna()
-                    muni_data = muni_data[muni_data.str.strip() != ""]
-                    if not muni_data.empty:
-                        top_muni = muni_data.value_counts().head(10).reset_index()
-                        top_muni.columns = ["自治体名", "案件数"]
-                        # Horizontal bar chart, sorted ascending so largest is at top
-                        fig_muni = px.bar(top_muni.sort_values("案件数", ascending=True), 
-                                          x="案件数", y="自治体名", orientation='h')
-                        fig_muni.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
-                        st.plotly_chart(fig_muni, use_container_width=True)
+                st.write("**案件が多い地域ランキング**")
+                col_m1, col_m2 = st.columns(2)
+                muni_level = col_m1.radio("集計単位", ["市区町村", "都道府県"], horizontal=True, label_visibility="collapsed")
+                muni_top_n = col_m2.selectbox("表示件数", [10, 20, 30], index=0, label_visibility="collapsed")
+                
+                if muni_level == "市区町村":
+                    pref = plot_df["B_都道府県"].replace("null", "").fillna("")
+                    city = plot_df["C_自治体名"].replace("null", "").fillna("")
+                    plot_df["地域名"] = pref + city
+                else:
+                    plot_df["地域名"] = plot_df["B_都道府県"].replace("null", "").fillna("")
+                    
+                valid_muni = plot_df[plot_df["地域名"].str.strip() != ""]
+                if not valid_muni.empty:
+                    grouped_muni = valid_muni.groupby("地域名").agg(
+                        案件数=("地域名", "size"),
+                        案件リスト=("D_案件名", lambda x: build_hover_list(x))
+                    ).reset_index()
+                    top_muni = grouped_muni.sort_values("案件数", ascending=False).head(muni_top_n)
+                    
+                    fig_muni = px.bar(top_muni.sort_values("案件数", ascending=True), 
+                                      x="案件数", y="地域名", orientation='h', custom_data=["案件リスト"])
+                    fig_muni.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=380, hoverlabel=dict(align="left"))
+                    fig_muni.update_traces(
+                        hovertemplate="<b>%{y}</b><br>案件数: %{x}件<br><br>【主な案件】<br>%{customdata[0]}<extra></extra>"
+                    )
+                    st.plotly_chart(fig_muni, use_container_width=True)
 
             with chart_col3:
-                if "M_契約期間年数" in market_df.columns:
+                if "M_契約期間年数" in plot_df.columns:
                     st.write("**契約年数の分布**")
-                    lengths_s = df_facilities["M_契約期間年数"].dropna()
-                    if not lengths_s.empty:
-                        lengths_df = lengths_s.astype(int).value_counts().reset_index()
-                        lengths_df.columns = ["契約年数", "案件数"]
-                        lengths_df["契約年数"] = lengths_df["契約年数"].astype(str) + "年"
-                        fig_bar = px.bar(lengths_df.sort_values("契約年数"), x="契約年数", y="案件数")
-                        fig_bar.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
+                    valid_lengths = plot_df.dropna(subset=["M_契約期間年数"]).copy()
+                    if not valid_lengths.empty:
+                        valid_lengths["M_契約期間年数"] = valid_lengths["M_契約期間年数"].astype(int)
+                        grouped_len = valid_lengths.groupby("M_契約期間年数").agg(
+                            案件数=("M_契約期間年数", "size"),
+                            案件リスト=("D_案件名", lambda x: build_hover_list(x))
+                        ).reset_index()
+                        
+                        # Sort by numeric value
+                        grouped_len = grouped_len.sort_values("M_契約期間年数")
+                        grouped_len["契約年数ラベル"] = grouped_len["M_契約期間年数"].astype(str) + "年"
+                        
+                        fig_bar = px.bar(grouped_len, x="契約年数ラベル", y="案件数", custom_data=["案件リスト"])
+                        fig_bar.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=380, hoverlabel=dict(align="left"))
+                        fig_bar.update_traces(
+                            hovertemplate="<b>%{x}</b><br>案件数: %{y}件<br><br>【主な案件】<br>%{customdata[0]}<extra></extra>"
+                        )
                         st.plotly_chart(fig_bar, use_container_width=True)
 
             # 2. Summary Table of Averages
@@ -660,7 +715,6 @@ def render_dashboard(df, spreadsheet_target):
     
     st.subheader("📋 提案要求・準備物 カタログ (全体傾向)")
     st.write("過去の案件で実際に求められた事項を全データから網羅的に確認し、社内の既存アセットの適応可否を判断するための材料です。")
-    st.write("※ このセクションのデータは、全体傾向をつかむためにフィルター条件の影響を受けません。")
     
     st.write("") # Spacing
     
@@ -717,13 +771,14 @@ def render_dashboard(df, spreadsheet_target):
                 st.warning("対象となるデータがありません。")
 
     with cat_tab2:
-        st.write("全ての案件データから、共通の要求事項や準備物をAIが近似でグルーピングしてまとめます。")
-        CACHE_PATH = "ai_catalog_summary_cache.txt"
+        CACHE_PATH = "ai_catalog_summary_cache_v2.json"
         
-        col_btn1, col_btn2 = st.columns([1, 4])
-        with col_btn1:
+        # Adjust column ratio to bring the right side further left
+        col_left, col_right = st.columns([1, 4])
+        with col_left:
+            st.write("AIを利用して全案件の要求をまとめます。")
             if st.button("🚀 まとめを生成・更新する"):
-                with st.spinner("AIが要約を生成しています... (約数十秒かかります)"):
+                with st.spinner("AIが要約を生成しています... (数十秒かかります)"):
                     summary_result = generate_ai_summary(filter_df)
                     try:
                         with open(CACHE_PATH, "w", encoding="utf-8") as f:
@@ -732,13 +787,26 @@ def render_dashboard(df, spreadsheet_target):
                     except Exception as err:
                         st.error(f"保存に失敗しました: {err}")
         
-        if os.path.exists(CACHE_PATH):
-            with open(CACHE_PATH, "r", encoding="utf-8") as f:
-                cached_text = f.read()
-            st.markdown(f"> *最後に生成されたまとめ結果を表示しています。*")
-            st.info(cached_text)
-        else:
-            st.info("💡 まだAIによるまとめが生成されていません。「まとめを生成・更新する」ボタンを押してください。")
+        with col_right:
+            if os.path.exists(CACHE_PATH):
+                with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                    cached_text = f.read()
+                try:
+                    import json
+                    data = json.loads(cached_text)
+                    if isinstance(data, dict) and "error" in data:
+                        st.error(data["error"])
+                    else:
+                        for section in data:
+                            st.markdown(f"#### {section.get('title', '')}")
+                            for group in section.get('groups', []):
+                                with st.expander(group.get('group_name', '無題')):
+                                    for detail in group.get('details', []):
+                                        st.write(f"・{detail}")
+                except Exception as e:
+                    st.info(cached_text)
+            else:
+                st.info("💡 左側のボタンを押してまとめを生成してください。")
 
     with cat_tab3:
         st.write(f"**詳細データ一覧 ({len(filter_df)}件)**")
