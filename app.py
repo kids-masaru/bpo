@@ -570,7 +570,7 @@ def render_dashboard(df, spreadsheet_target):
 
     st.subheader("📊 施設ごとの市場データ")
     st.markdown("##### 🔍 市場データの絞り込み")
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
     
     market_df = df.copy()
     
@@ -594,6 +594,13 @@ def render_dashboard(df, spreadsheet_target):
             selected_facilities = st.multiselect("施設区分", facilities, default=facilities)
             if selected_facilities:
                 market_df = market_df[market_df["E_施設区分"].astype(str).isin(selected_facilities)]
+
+    with filter_col4:
+        if "N_契約方式" in market_df.columns:
+            methods = sorted([str(x) for x in market_df["N_契約方式"].dropna().unique() if x])
+            selected_methods = st.multiselect("契約方式", methods, default=methods)
+            if selected_methods:
+                market_df = market_df[market_df["N_契約方式"].astype(str).isin(selected_methods)]
 
     st.write("---")
     
@@ -703,6 +710,12 @@ def render_dashboard(df, spreadsheet_target):
                 
             if agg_dict:
                 grouped = df_facilities.groupby("E_施設区分").agg(agg_dict).reset_index()
+                
+                # 指定された並び順でソート（表記揺れ等も考慮して網羅的に定義）
+                sort_order = ["学童", "子育て", "放課後子供教室", "複合施設", "子育て支援拠点", "児童館", "その他", "そのほか"]
+                grouped["sort_key"] = grouped["E_施設区分"].apply(lambda x: sort_order.index(x) if x in sort_order else 999)
+                grouped = grouped.sort_values("sort_key").drop("sort_key", axis=1)
+                
                 display_grouped = pd.DataFrame()
                 display_grouped["施設区分"] = grouped["E_施設区分"]
                 if "O_年間基本額上限" in grouped.columns:
@@ -725,6 +738,15 @@ def render_dashboard(df, spreadsheet_target):
     with cat_tab1:
         st.write("主要なキーワードが「提案要求・準備物」の中にどれくらい出現しているかを集計します。")
         
+        # レーダーチャート用の施設区分フィルターを追加
+        if "E_施設区分" in filter_df.columns:
+            radar_facilities = sorted([str(x) for x in filter_df["E_施設区分"].dropna().unique() if x])
+            selected_radar_facilities = st.multiselect("対象とする施設区分を絞り込み（レーダーチャート用）", radar_facilities, default=radar_facilities, key="radar_facility_filter")
+        else:
+            selected_radar_facilities = None
+            
+        st.write("---")
+        
         if "AO_提案要求リスト" in df.columns or "AP_物理的システム的準備リスト" in df.columns:
             keywords = {
                 "安全・防災（危機管理）": ["安全", "防災", "危機管理", "避難", "事故"],
@@ -736,7 +758,10 @@ def render_dashboard(df, spreadsheet_target):
                 "研修・人材育成": ["研修", "育成", "人材", "スキル"]
             }
             
-            target_df = filter_df
+            target_df = filter_df.copy()
+            if selected_radar_facilities is not None:
+                target_df = target_df[target_df["E_施設区分"].astype(str).isin(selected_radar_facilities)]
+                
             fit_stats = []
             
             text_series = pd.Series(dtype=str)
