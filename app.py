@@ -564,6 +564,15 @@ def generate_ai_summary(df):
         return f'{{"error": "AI要約の生成に失敗しました: {e}"}}'
 
 def render_dashboard(df, spreadsheet_target):
+    st.markdown("""
+<style>
+/* Streamlit multiselect custom height limit */
+div[data-baseweb="select"] > div:first-child {
+    max-height: 48px !important;
+    overflow-y: auto !important;
+}
+</style>
+""", unsafe_allow_html=True)
     if df.empty:
         st.info("📊 まだデータがありません。解析・登録からデータを追加してください。")
         return
@@ -737,14 +746,7 @@ def render_dashboard(df, spreadsheet_target):
     
     with cat_tab1:
         st.write("主要なキーワードが「提案要求・準備物」の中にどれくらい出現しているかを集計します。")
-        
-        # レーダーチャート用の施設区分フィルターを追加
-        if "E_施設区分" in filter_df.columns:
-            radar_facilities = sorted([str(x) for x in filter_df["E_施設区分"].dropna().unique() if x])
-            selected_radar_facilities = st.multiselect("対象とする施設区分を絞り込み（レーダーチャート用）", radar_facilities, default=radar_facilities, key="radar_facility_filter")
-        else:
-            selected_radar_facilities = None
-            
+        st.write("各施設区分ごとの傾向を比較できます。以下に全体と各施設区分の分布を順に表示します。")
         st.write("---")
         
         if "AO_提案要求リスト" in df.columns or "AP_物理的システム的準備リスト" in df.columns:
@@ -758,27 +760,38 @@ def render_dashboard(df, spreadsheet_target):
                 "研修・人材育成": ["研修", "育成", "人材", "スキル"]
             }
             
-            target_df = filter_df.copy()
-            if selected_radar_facilities is not None:
-                target_df = target_df[target_df["E_施設区分"].astype(str).isin(selected_radar_facilities)]
+            if "E_施設区分" in filter_df.columns:
+                radar_facilities = sorted([str(x) for x in filter_df["E_施設区分"].dropna().unique() if x])
+                sort_order = ["学童", "子育て", "放課後子供教室", "複合施設", "子育て支援拠点", "児童館", "その他", "そのほか"]
+                radar_facilities = sorted(radar_facilities, key=lambda x: sort_order.index(x) if x in sort_order else 999)
+            else:
+                radar_facilities = []
                 
-            fit_stats = []
-            
-            text_series = pd.Series(dtype=str)
-            if "AO_提案要求リスト" in target_df.columns:
-                text_series = target_df["AO_提案要求リスト"].astype(str)
-            if "AP_物理的システム的準備リスト" in target_df.columns:
-                text_series = text_series + " " + target_df["AP_物理的システム的準備リスト"].astype(str)
+            loop_targets = [("全体（合計）", filter_df.copy())]
+            for fac in radar_facilities:
+                loop_targets.append((fac, filter_df[filter_df["E_施設区分"].astype(str) == fac].copy()))
                 
-            total_records = len(target_df)
-            
-            if total_records > 0:
+            has_data = False
+            for fac_name, target_df in loop_targets:
+                total_records = len(target_df)
+                if total_records == 0:
+                    continue
+                    
+                has_data = True
+                fit_stats = []
+                text_series = pd.Series(dtype=str)
+                if "AO_提案要求リスト" in target_df.columns:
+                    text_series = target_df["AO_提案要求リスト"].astype(str)
+                if "AP_物理的システム的準備リスト" in target_df.columns:
+                    text_series = text_series + " " + target_df["AP_物理的システム的準備リスト"].astype(str)
+                    
                 for label, kws in keywords.items():
                     count = text_series.str.contains("|".join(kws), case=False, na=False).sum()
                     fit_stats.append({"要素": label, "出現件数": count, "全体に対する割合(%)": round((count/total_records)*100, 1)})
                 
                 fit_df = pd.DataFrame(fit_stats)
                 
+                st.markdown(f"#### 【{fac_name}】の要求キーワード分布")
                 col_chart1, col_chart2 = st.columns(2)
                 with col_chart1:
                     plot_df = fit_df.copy()
@@ -786,13 +799,15 @@ def render_dashboard(df, spreadsheet_target):
                     
                     fig_radar = px.line_polar(plot_df, r="割合", theta="要素", line_close=True, markers=True,
                                               hover_data=["出現件数"],
-                                              title=f"全体の要求キーワード分布",
                                               range_r=[0, 100])
                     fig_radar.update_traces(fill='toself')
                     st.plotly_chart(fig_radar, use_container_width=True)
                 with col_chart2:
                     st.dataframe(fit_df, use_container_width=True, hide_index=True)
-            else:
+                
+                st.write("---")
+                
+            if not has_data:
                 st.warning("対象となるデータがありません。")
 
     with cat_tab2:
